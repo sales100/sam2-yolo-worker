@@ -374,6 +374,7 @@ class Trainer:
             self.progress("evaluating")
             split = "test" if self.has_test else "val"
             ev = self.evaluate(best, split)
+            ev["split"] = split
             reg = None
             if s.get("weights_local") and self.task == "detect":
                 reg = self.regression(ev, s["weights_local"], split)
