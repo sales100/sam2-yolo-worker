@@ -13,5 +13,5 @@ ARG SAM2_MODEL=facebook/sam2.1-hiera-small
 ENV SAM2_MODEL=${SAM2_MODEL}
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('${SAM2_MODEL}')"
 WORKDIR /app
-COPY handler.py server.py ./
+COPY handler.py server.py trainer.py ./
 CMD ["python", "-u", "handler.py"]

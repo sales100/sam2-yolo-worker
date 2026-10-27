@@ -21,7 +21,6 @@ import tempfile
 import urllib.request
 
 import numpy as np
-import runpod
 import torch
 from PIL import Image
 
@@ -86,6 +85,46 @@ def is_yolov5(pt_path: str) -> bool:
         return False
 
 
+def export_file(pt: str, family: str, imgsz: int):
+    """Export a local .pt to ONNX (opset 12). Returns (onnx_path, names, family, output_shape)."""
+    family = (family or "").lower()
+    if family not in ("yolov5", "yolov8"):
+        family = "yolov5" if is_yolov5(pt) else "yolov8"
+    names = []
+    if family == "yolov5":
+        r = subprocess.run(
+            [sys.executable, "export.py", "--weights", pt, "--include", "onnx", "--imgsz", str(imgsz), "--opset", "12", "--simplify"],
+            cwd=YOLOV5_DIR, capture_output=True, text=True, timeout=900,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("yolov5 export failed: " + (r.stderr or r.stdout)[-800:])
+        onnx = os.path.splitext(pt)[0] + ".onnx"
+        try:
+            sys.path.insert(0, YOLOV5_DIR)
+            ck = torch.load(pt, map_location="cpu", weights_only=False)
+            n = (ck.get("model") or ck.get("ema")).names
+            names = list(n.values()) if isinstance(n, dict) else list(n)
+        except Exception:
+            pass
+    else:
+        from ultralytics import YOLO
+        m = YOLO(pt)
+        names = list(m.names.values()) if isinstance(m.names, dict) else list(m.names)
+        onnx = m.export(format="onnx", imgsz=imgsz, opset=12, simplify=True, dynamic=False, nms=False)
+    import onnxruntime as ort
+    sess = ort.InferenceSession(onnx, providers=["CPUExecutionProvider"])
+    return onnx, names, family, list(sess.get_outputs()[0].shape)
+
+
+def put_file(url: str, path: str, content_type="application/octet-stream"):
+    data = open(path, "rb").read()
+    req = urllib.request.Request(url, data=data, method="PUT", headers={"Content-Type": content_type})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        if r.status not in (200, 201, 204):
+            raise RuntimeError(f"upload failed {r.status}")
+    return len(data)
+
+
 def export(inp):
     imgsz = int(inp.get("imgsz") or 640)
     if not (160 <= imgsz <= 2048 and imgsz % 32 == 0):
@@ -95,39 +134,9 @@ def export(inp):
         pt = os.path.join(work, "best.pt")
         with open(pt, "wb") as f:
             f.write(fetch(inp["pt_url"], MAX_PT_BYTES))
-        family = (inp.get("family") or "").lower()
-        if family not in ("yolov5", "yolov8"):
-            family = "yolov5" if is_yolov5(pt) else "yolov8"
-        names = []
-        if family == "yolov5":
-            r = subprocess.run(
-                [sys.executable, "export.py", "--weights", pt, "--include", "onnx", "--imgsz", str(imgsz), "--opset", "12", "--simplify"],
-                cwd=YOLOV5_DIR, capture_output=True, text=True, timeout=600,
-            )
-            if r.returncode != 0:
-                return {"error": "yolov5 export failed: " + (r.stderr or r.stdout)[-800:]}
-            onnx = os.path.join(work, "best.onnx")
-            try:
-                sys.path.insert(0, YOLOV5_DIR)
-                ck = torch.load(pt, map_location="cpu", weights_only=False)
-                n = (ck.get("model") or ck.get("ema")).names
-                names = list(n.values()) if isinstance(n, dict) else list(n)
-            except Exception:
-                pass
-        else:
-            from ultralytics import YOLO
-            m = YOLO(pt)
-            names = list(m.names.values()) if isinstance(m.names, dict) else list(m.names)
-            onnx = m.export(format="onnx", imgsz=imgsz, opset=12, simplify=True, dynamic=False, nms=False)
-        import onnxruntime as ort
-        sess = ort.InferenceSession(onnx, providers=["CPUExecutionProvider"])
-        out_shape = list(sess.get_outputs()[0].shape)
-        data = open(onnx, "rb").read()
-        req = urllib.request.Request(inp["put_url"], data=data, method="PUT", headers={"Content-Type": "application/octet-stream"})
-        with urllib.request.urlopen(req, timeout=300) as r:
-            if r.status not in (200, 201, 204):
-                return {"error": f"upload failed {r.status}"}
-        return {"bytes": len(data), "imgsz": imgsz, "names": names[:1000], "family": family, "output_shape": out_shape}
+        onnx, names, family, out_shape = export_file(pt, inp.get("family") or "", imgsz)
+        size = put_file(inp["put_url"], onnx)
+        return {"bytes": size, "imgsz": imgsz, "names": names[:1000], "family": family, "output_shape": out_shape}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -142,12 +151,17 @@ def handler(job):
             return segment(inp)
         if op == "export":
             return export(inp)
+        if op == "train":  # Serverless fallback for short jobs; long jobs run as a Pod (trainer.py --pod)
+            import trainer
+            return trainer.run_standalone(inp)
         return {"error": "unknown op"}
     except Exception as e:  # never echo inputs (URLs are credentials)
         return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
 
 
 if __name__ == "__main__":
+    import runpod
+
     if os.environ.get("PRELOAD_SAM2", "1") == "1":
         predictor()
     runpod.serverless.start({"handler": handler})
