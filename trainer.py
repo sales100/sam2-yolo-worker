@@ -221,6 +221,12 @@ class Trainer:
     def command(self, resume: bool):
         s, hyp = self.spec, self.spec.get("hyperparameters") or {}
         epochs, imgsz, batch = int(s["epochs"]), int(s["imgsz"]), int(hyp.get("batch", -1))
+        # Early stopping is OFF unless the OMS sent early_stop=true with a patience. Older runs without the flag keep
+        # their explicit patience. "Off" = YOLOv5 patience 0 (EarlyStopping: `patience or inf`, pinned af08ba1)
+        # and for ultralytics a patience longer than the run, which can never trigger in any 8.x version.
+        pat = int(hyp.get("patience") or 0) if hyp.get("early_stop", "patience" in hyp) else 0
+        v5_patience = pat if pat > 0 else 0
+        v8_patience = pat if pat > 0 else epochs + 1
         weights = s.get("weights_local") or s["base_model"]  # parent .pt (fine-tune) or e.g. yolov5s.pt
         last = os.path.join(self.out_dir(), "weights", "last.pt")
         proj = os.path.join(self.dir, "out")
@@ -233,7 +239,7 @@ class Trainer:
                 return [sys.executable, "train.py", "--resume", last], YOLOV5_DIR
             cmd = [sys.executable, "train.py", "--data", self.data, "--weights", weights, "--epochs", str(epochs), "--imgsz", str(imgsz),
                    "--batch-size", str(batch), "--project", proj, "--name", "run", "--exist-ok", "--workers", "2",
-                   "--patience", str(int(hyp.get("patience", 100)))]
+                   "--patience", str(v5_patience)]
             if hyp.get("freeze"):
                 cmd += ["--freeze", str(int(hyp["freeze"]))]
             if hyp.get("optimizer"):
@@ -242,7 +248,7 @@ class Trainer:
                 cmd += ["--cache", "disk"]
             return cmd, YOLOV5_DIR
         args = dict(data=self.data, epochs=epochs, imgsz=imgsz, batch=batch, project=proj, name="run", exist_ok=True, workers=2,
-                    patience=int(hyp.get("patience", 100)), plots=True)
+                    patience=v8_patience, plots=True)
         for k in ("lr0", "lrf", "momentum", "weight_decay", "optimizer", "freeze", "mosaic", "fliplr", "hsv_h", "hsv_s", "hsv_v", "degrees"):
             if k in hyp:
                 args[k] = hyp[k]
