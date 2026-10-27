@@ -23,13 +23,59 @@ import subprocess
 import sys
 import threading
 import time
+import random
+import http.client
+import socket
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 YOLOV5_DIR = os.environ.get("YOLOV5_DIR", "/opt/yolov5")
 WORK_ROOT = os.environ.get("TRAIN_WORK", "/workspace/train" if os.path.isdir("/workspace") else os.path.join(os.getcwd(), "train"))
 PROGRESS_EVERY = 20  # seconds
-VERSION = "train-1"
+VERSION = "train-2"
+LOG_TAIL_MAX = 12000  # chars sent to the OMS (well under the 6 MB function body limit)
+
+
+
+def transient(e) -> bool:
+    """Network errors worth retrying: resets, timeouts, dropped connections, 408/425/429/5xx."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 425, 429) or e.code >= 500
+    return isinstance(e, (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError,
+                          socket.timeout, OSError))
+
+
+def retry(fn, what="request", tries=6, base=2.0, cap=60.0, log=None):
+    """Call fn() with exponential backoff + jitter on transient network errors."""
+    for n in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if n >= tries or not transient(e):
+                raise
+            wait = min(cap, base * 2 ** (n - 1)) * (0.5 + random.random())
+            if log:
+                log(f"{what} failed ({type(e).__name__}: {str(e)[:120]}); retry {n}/{tries - 1} in {wait:.0f}s")
+            time.sleep(wait)
+
+
+def norm_classes(raw):
+    """Manifest classes as [{name, class_index, ...}] sorted by index. Accepts class_index, index, or list order."""
+    out = []
+    for n, c in enumerate(raw):
+        c = dict(c) if isinstance(c, dict) else {"name": str(c)}
+        ci = c.get("class_index", c.get("index"))
+        c["class_index"] = int(ci) if ci is not None else n
+        out.append(c)
+    return sorted(out, key=lambda c: c["class_index"])
+
+
+def shape_class(sh, by_id):
+    ci = sh.get("class_index", sh.get("index"))
+    if ci is None and sh.get("class_id"):
+        ci = by_id.get(sh["class_id"])
+    return int(ci) if ci is not None else None
 
 
 class Cancelled(Exception):
@@ -42,7 +88,11 @@ class Oms:
     def __init__(self, base: str, node: str, key: str):
         self.base, self.node, self.key = base.rstrip("/"), node, key.encode()
 
-    def post(self, op: str, body: dict, timeout=60) -> dict:
+    def post(self, op: str, body: dict, timeout=60, tries=6, log=None) -> dict:
+        """Signed POST, retried with backoff. Each attempt is re-signed with a fresh ts (replay guard)."""
+        return retry(lambda: self._post(op, body, timeout), f"OMS {op}", tries=tries, log=log)
+
+    def _post(self, op: str, body: dict, timeout=60) -> dict:
         body = dict(body, node=self.node, ts=int(time.time() * 1000))
         raw = json.dumps(body, separators=(",", ":")).encode()
         sig = hmac.new(self.key, raw, hashlib.sha256).hexdigest()
@@ -58,7 +108,7 @@ class Offline:
     def __init__(self, spec):
         self.spec = spec
 
-    def post(self, op, body, timeout=60):
+    def post(self, op, body, timeout=60, tries=1, log=None):
         if op == "progress":
             print("PROGRESS", json.dumps({k: body.get(k) for k in ("epoch", "epochs", "metrics", "phase")}), flush=True)
             return {"cancel": False}
@@ -70,29 +120,58 @@ class Offline:
         return {}
 
 
-def get(url, dest, limit=2 * 1024 ** 3):
+class Expired(Exception):
+    """A presigned URL was refused (403/404/400): ask the OMS for fresh URLs."""
+
+
+def _get_once(url, dest, limit):
     tmp = dest + ".part"
-    with urllib.request.urlopen(url, timeout=300) as r, open(tmp, "wb") as f:
-        n = 0
-        while True:
-            b = r.read(1 << 20)
-            if not b:
-                break
-            n += len(b)
-            if n > limit:
-                raise RuntimeError("download too large")
-            f.write(b)
+    have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+    req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+    try:
+        r = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:  # already complete
+            os.replace(tmp, dest)
+            return
+        if e.code in (400, 403, 404):
+            raise Expired(f"HTTP {e.code}") from e
+        raise
+    with r:
+        mode = "ab" if have and r.status == 206 else "wb"  # server ignored Range: start over
+        n = have if mode == "ab" else 0
+        with open(tmp, mode) as f:
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                n += len(b)
+                if n > limit:
+                    raise RuntimeError("download too large")
+                f.write(b)
+        cl = r.headers.get("Content-Length")
+        if cl is not None and n - (have if mode == "ab" else 0) < int(cl):
+            raise ConnectionError("download truncated")
     os.replace(tmp, dest)
 
 
-def put(url, path):
-    with open(path, "rb") as f:
-        data = f.read()
-    req = urllib.request.Request(url, data=data, method="PUT", headers={"Content-Type": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=900) as r:
-        if r.status not in (200, 201, 204):
-            raise RuntimeError(f"upload failed {r.status}")
-    return len(data)
+def get(url, dest, limit=2 * 1024 ** 3, tries=6, log=None):
+    """Resumable download (keeps the .part file and continues with a Range request) with retries."""
+    retry(lambda: _get_once(url, dest, limit), f"download {os.path.basename(dest)}", tries=tries, log=log)
+
+
+def put(url, path, tries=6, log=None):
+    size = os.path.getsize(path)
+
+    def once():
+        with open(path, "rb") as f:
+            req = urllib.request.Request(url, data=f, method="PUT",
+                                         headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)})
+            with urllib.request.urlopen(req, timeout=900) as r:
+                if r.status not in (200, 201, 204):
+                    raise RuntimeError(f"upload failed {r.status}")
+    retry(once, f"upload {os.path.basename(path)}", tries=tries, log=log)
+    return size
 
 
 def safe(name: str) -> str:
@@ -119,7 +198,8 @@ class Trainer:
     def progress(self, phase, epoch=None, epochs=None, metrics=None):
         try:
             r = self.oms.post("progress", {"run_id": self.run_id, "phase": phase, "epoch": epoch, "epochs": epochs,
-                                           "metrics": metrics or {}, "log_tail": "\n".join(self.tail[-60:])[-8000:]})
+                                           "metrics": metrics or {}, "log_tail": "\n".join(self.tail[-60:])[-8000:]},
+                              timeout=30, tries=3, log=self.log)
             if r.get("cancel"):
                 self.cancel = True
         except Exception as e:  # network blips must not kill a multi-hour run
@@ -148,23 +228,50 @@ class Trainer:
             h = hashlib.sha256(open(man_path, "rb").read()).hexdigest()
             if h != s["manifest_sha256"]:
                 raise RuntimeError("manifest checksum mismatch")
-        classes = sorted(man["classes"], key=lambda c: c["class_index"])
+        classes = norm_classes(man.get("classes") or [])
         names = [c["name"] for c in classes]
+        by_id = {c["id"]: c["class_index"] for c in classes if c.get("id")}
         cache = os.path.join(self.dir, "img")
         os.makedirs(cache, exist_ok=True)
         urls = s["images"]
         items = [i for i in man["items"] if i.get("file_id") in urls]
         self.say(f"dataset: {len(items)} images, {len(names)} classes")
 
-        def fetch(i):
+        def path_of(i):
             ext = os.path.splitext(i.get("file_name") or "")[1].lower() or ".jpg"
-            p = os.path.join(cache, i["file_id"] + ext)
-            if not os.path.exists(p):
-                get(urls[i["file_id"]], p, 200 * 1024 ** 2)
-            return p
+            return os.path.join(cache, i["file_id"] + ext)
 
-        with ThreadPoolExecutor(8) as ex:
-            paths = list(ex.map(fetch, items))
+        def fetch(i):
+            p = path_of(i)
+            if not os.path.exists(p):  # cached images survive a restart: the download resumes
+                try:
+                    get(urls[i["file_id"]], p, 200 * 1024 ** 2, log=self.log)
+                except Exception as e:
+                    return e
+            return None
+
+        for rnd in range(3):
+            todo = [i for i in items if not os.path.exists(path_of(i))]
+            if not todo:
+                break
+            self.say(f"downloading {len(todo)} images" + (f" (pass {rnd + 1})" if rnd else ""))
+            with ThreadPoolExecutor(6) as ex:
+                errs = [e for e in ex.map(fetch, todo) if e is not None]
+            if not errs:
+                break
+            self.say(f"{len(errs)} image downloads failed ({type(errs[0]).__name__}: {str(errs[0])[:120]})")
+            if rnd < 2:  # fresh presigned URLs (they may have expired) and try the rest again
+                try:
+                    fresh = (self.oms.post("job", {"run_id": self.run_id}, timeout=120, log=self.log).get("job") or {}).get("images")
+                    if fresh:
+                        urls.update(fresh)
+                except Exception as e:
+                    self.log(f"URL refresh failed: {e}")
+                time.sleep(15)
+        missing = [i for i in items if not os.path.exists(path_of(i))]
+        if missing:
+            raise RuntimeError(f"{len(missing)} of {len(items)} images could not be downloaded after retries")
+        paths = [path_of(i) for i in items]
         root = os.path.join(self.dir, "ds")
         shutil.rmtree(root, ignore_errors=True)
         splits = {"train": "train", "valid": "val", "test": "test"}
@@ -174,6 +281,8 @@ class Trainer:
             ext = os.path.splitext(p)[1]
             if self.task == "classify":
                 ci = i.get("image_tag_class_index")
+                if ci is None and i.get("image_tag_class_id"):
+                    ci = by_id.get(i["image_tag_class_id"])
                 if ci is None or not (0 <= ci < len(names)):
                     continue
                 d = os.path.join(root, sp, safe(names[ci]))
@@ -191,7 +300,10 @@ class Trainer:
                     x, y, w, h = (max(0.0, min(1.0, float(g[k]))) for k in ("x", "y", "w", "h"))
                     if w <= 0 or h <= 0:
                         continue
-                    lines.append(f"{sh['class_index']} {x + w / 2:.6f} {y + h / 2:.6f} {w:.6f} {h:.6f}")
+                    ci = shape_class(sh, by_id)
+                    if ci is None or not (0 <= ci < len(names)):
+                        continue
+                    lines.append(f"{ci} {x + w / 2:.6f} {y + h / 2:.6f} {w:.6f} {h:.6f}")
                 with open(os.path.join(root, "labels", sp, stem + ".txt"), "w") as f:
                     f.write("\n".join(lines))
         if self.task == "classify":
@@ -369,7 +481,7 @@ class Trainer:
             if s.get("parent_pt_url"):
                 pp = os.path.join(self.dir, "parent.pt")
                 if not os.path.exists(pp):
-                    get(s["parent_pt_url"], pp)
+                    get(s["parent_pt_url"], pp, log=self.log)
                 s["weights_local"] = pp
             self.progress("training", 0, int(s["epochs"]))
             self.train(resume=resume)
@@ -404,25 +516,25 @@ class Trainer:
             files = {k: v for k, v in files.items() if os.path.exists(v)}
             self.progress("uploading")
             urls = self.oms.post("uploads", {"run_id": self.run_id, "names": list(files),
-                                             "sizes": {k: os.path.getsize(v) for k, v in files.items()}}).get("urls", {})
+                                             "sizes": {k: os.path.getsize(v) for k, v in files.items()}}, log=self.log).get("urls", {})
             uploaded = {}
             for n, p in files.items():
                 if n in urls:
-                    uploaded[n] = {"bytes": put(urls[n], p), "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()}
+                    uploaded[n] = {"bytes": put(urls[n], p, log=self.log), "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()}
             self.oms.post("complete", {"run_id": self.run_id, "status": "succeeded", "metrics": self.final, "eval": ev,
                                        "regression": reg, "files": uploaded, "names": self.names,
-                                       "log_tail": "\n".join(self.tail)[-18000:]}, timeout=180)
+                                       "log_tail": "\n".join(self.tail)[-LOG_TAIL_MAX:]}, timeout=180, tries=8, log=self.log)
             shutil.rmtree(self.dir, ignore_errors=True)
             return "succeeded"
         except Cancelled:
-            self.oms.post("complete", {"run_id": self.run_id, "status": "cancelled", "log_tail": "\n".join(self.tail)[-18000:]})
+            self.oms.post("complete", {"run_id": self.run_id, "status": "cancelled", "log_tail": "\n".join(self.tail)[-LOG_TAIL_MAX:]}, tries=8, log=self.log)
             shutil.rmtree(self.dir, ignore_errors=True)
             return "cancelled"
         except Exception as e:
             self.say(f"ERROR: {e}")
             try:
                 self.oms.post("complete", {"run_id": self.run_id, "status": "failed", "error": str(e)[:1000],
-                                           "log_tail": "\n".join(self.tail)[-18000:]})
+                                           "log_tail": "\n".join(self.tail)[-LOG_TAIL_MAX:]}, tries=8, log=self.log)
             except Exception:
                 pass
             return "failed"
@@ -441,7 +553,7 @@ def main():
     if "--pod" in sys.argv:
         oms = Oms(os.environ.get("OMS_URL", ""), "run:" + os.environ.get("OMS_RUN_ID", ""), os.environ.get("OMS_RUN_TOKEN", ""))
         if os.environ.get("OMS_SPEC_URL"):  # smoke test: spec fetched from a presigned URL, nothing reported to the OMS
-            with urllib.request.urlopen(os.environ["OMS_SPEC_URL"], timeout=60) as r:
+            with retry(lambda: urllib.request.urlopen(os.environ["OMS_SPEC_URL"], timeout=60), "spec") as r:
                 spec = json.loads(r.read())
             print(run_standalone(spec), flush=True)
         else:
