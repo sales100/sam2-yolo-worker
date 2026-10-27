@@ -432,11 +432,11 @@ def main():
         print(run_standalone(spec))
         return
     if "--pod" in sys.argv:
-        oms = Oms(os.environ["OMS_URL"], "run:" + os.environ["OMS_RUN_ID"], os.environ["OMS_RUN_TOKEN"])
-        if os.environ.get("OMS_SPEC_B64"):  # smoke test: spec passed in, nothing reported to the OMS
-            import base64
-            spec = json.loads(base64.b64decode(os.environ["OMS_SPEC_B64"]))
-            print(run_standalone(spec))
+        oms = Oms(os.environ.get("OMS_URL", ""), "run:" + os.environ.get("OMS_RUN_ID", ""), os.environ.get("OMS_RUN_TOKEN", ""))
+        if os.environ.get("OMS_SPEC_URL"):  # smoke test: spec fetched from a presigned URL, nothing reported to the OMS
+            with urllib.request.urlopen(os.environ["OMS_SPEC_URL"], timeout=60) as r:
+                spec = json.loads(r.read())
+            print(run_standalone(spec), flush=True)
         else:
             spec = oms.post("job", {"run_id": os.environ["OMS_RUN_ID"]}).get("job")
             if spec:
